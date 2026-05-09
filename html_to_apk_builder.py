@@ -1300,6 +1300,7 @@ class ApkBuilderApp(tk.Tk):
         # Phase: patch
         self._begin_phase("patch", "Applying Android settings", 38)
         self.patch_manifest(project_dir, app_name)
+        self.patch_oauth_persistence(project_dir, package_id)
         self.patch_gradle_versions(project_dir)
         self.write_gradle_properties(project_dir)
         self._end_phase("patch")
@@ -1448,6 +1449,97 @@ class ApkBuilderApp(tk.Tk):
             application.set(f"{ns}label", app_name)
 
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
+
+    def patch_oauth_persistence(self, project_dir: Path, package_id: str):
+        main_src_root = project_dir / "android" / "app" / "src" / "main"
+        java_file = main_src_root / "java" / Path(*package_id.split(".")) / "MainActivity.java"
+        kotlin_file = main_src_root / "kotlin" / Path(*package_id.split(".")) / "MainActivity.kt"
+
+        if java_file.exists():
+            java_file.write_text(
+                f"""package {package_id};
+
+import android.os.Bundle;
+import android.webkit.CookieManager;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+
+import com.getcapacitor.BridgeActivity;
+
+public class MainActivity extends BridgeActivity {{
+    @Override
+    public void onCreate(Bundle savedInstanceState) {{
+        super.onCreate(savedInstanceState);
+
+        WebView webView = getBridge().getWebView();
+        WebSettings settings = webView.getSettings();
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+
+        CookieManager cookieManager = CookieManager.getInstance();
+        cookieManager.setAcceptCookie(true);
+        cookieManager.setAcceptThirdPartyCookies(webView, true);
+        cookieManager.flush();
+    }}
+
+    @Override
+    public void onPause() {{
+        CookieManager.getInstance().flush();
+        super.onPause();
+    }}
+
+    @Override
+    public void onStop() {{
+        CookieManager.getInstance().flush();
+        super.onStop();
+    }}
+}}
+""",
+                encoding="utf-8",
+            )
+            self.log("Enabled WebView cookie and storage persistence for OAuth sessions.", "ok")
+            return
+
+        if kotlin_file.exists():
+            kotlin_file.write_text(
+                f"""package {package_id}
+
+import android.os.Bundle
+import android.webkit.CookieManager
+import com.getcapacitor.BridgeActivity
+
+class MainActivity : BridgeActivity() {{
+    override fun onCreate(savedInstanceState: Bundle?) {{
+        super.onCreate(savedInstanceState)
+
+        val webView = bridge.webView
+        webView.settings.domStorageEnabled = true
+        webView.settings.databaseEnabled = true
+
+        CookieManager.getInstance().apply {{
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+            flush()
+        }}
+    }}
+
+    override fun onPause() {{
+        CookieManager.getInstance().flush()
+        super.onPause()
+    }}
+
+    override fun onStop() {{
+        CookieManager.getInstance().flush()
+        super.onStop()
+    }}
+}}
+""",
+                encoding="utf-8",
+            )
+            self.log("Enabled WebView cookie and storage persistence for OAuth sessions.", "ok")
+            return
+
+        self.log("MainActivity not found; skipped OAuth persistence patch.", "warn")
 
     def patch_gradle_versions(self, project_dir: Path):
         gradle_file = project_dir / "android" / "app" / "build.gradle"
