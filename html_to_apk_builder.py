@@ -1270,7 +1270,7 @@ class ApkBuilderApp(tk.Tk):
         # Phase: copy
         self._begin_phase("copy", "Copying web assets", 8)
         copied = self.copy_web_files(html, www_dir)
-        self.write_node_project(project_dir, app_name, package_id)
+        self.write_node_project(project_dir, app_name, package_id, html)
         self._end_phase("copy", detail=f"{copied} item(s)")
 
         # Phase: npm install (skip if cached)
@@ -1396,7 +1396,7 @@ class ApkBuilderApp(tk.Tk):
                 self.log(f"  could not copy {item.name}: {exc}", "warn")
         return count
 
-    def write_node_project(self, project_dir: Path, app_name: str, package_id: str):
+    def write_node_project(self, project_dir: Path, app_name: str, package_id: str, html: Path):
         package_json = {
             "name": slugify(app_name),
             "version": self.version_name.get().strip(),
@@ -1415,6 +1415,27 @@ class ApkBuilderApp(tk.Tk):
             "webDir": "www",
             "server": {"androidScheme": "https"},
         }
+        try:
+            html_text = html.read_text(encoding="utf-8", errors="ignore").lower()
+        except Exception:
+            html_text = ""
+        if "inhousenotes.com" in html_text:
+            allow_navigation = [
+                "inhousenotes.com",
+                "*.inhousenotes.com",
+                "accounts.google.com",
+                "*.google.com",
+                "*.googleusercontent.com",
+                "*.gstatic.com",
+            ]
+            capacitor_config["allowNavigation"] = allow_navigation
+            capacitor_config["server"] = {
+                "url": "https://inhousenotes.com/?inhouse_app=1",
+                "cleartext": False,
+                "androidScheme": "https",
+                "allowNavigation": allow_navigation,
+            }
+            self.log("Configured Inhouse Notes to load inside the app WebView.", "ok")
         (project_dir / "package.json").write_text(json.dumps(package_json, indent=2), encoding="utf-8")
         (project_dir / "capacitor.config.json").write_text(
             json.dumps(capacitor_config, indent=2), encoding="utf-8"
@@ -1447,6 +1468,37 @@ class ApkBuilderApp(tk.Tk):
         application = root.find("application")
         if application is not None:
             application.set(f"{ns}label", app_name)
+            activity = None
+            for candidate in application.findall("activity"):
+                name = candidate.attrib.get(f"{ns}name", "")
+                if name.endswith("MainActivity"):
+                    activity = candidate
+                    break
+            if activity is not None:
+                activity.set(f"{ns}exported", "true")
+                has_app_callback = False
+                for intent_filter in activity.findall("intent-filter"):
+                    for data_node in intent_filter.findall("data"):
+                        if (
+                            data_node.attrib.get(f"{ns}scheme") == "inhousenotes"
+                            and data_node.attrib.get(f"{ns}host") == "oauth2callback"
+                        ):
+                            has_app_callback = True
+                            break
+                    if has_app_callback:
+                        break
+                if not has_app_callback:
+                    intent_filter = ET.Element("intent-filter")
+                    action = ET.SubElement(intent_filter, "action")
+                    action.set(f"{ns}name", "android.intent.action.VIEW")
+                    category_default = ET.SubElement(intent_filter, "category")
+                    category_default.set(f"{ns}name", "android.intent.category.DEFAULT")
+                    category_browsable = ET.SubElement(intent_filter, "category")
+                    category_browsable.set(f"{ns}name", "android.intent.category.BROWSABLE")
+                    data = ET.SubElement(intent_filter, "data")
+                    data.set(f"{ns}scheme", "inhousenotes")
+                    data.set(f"{ns}host", "oauth2callback")
+                    activity.append(intent_filter)
 
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
@@ -1460,7 +1512,10 @@ class ApkBuilderApp(tk.Tk):
                 f"""package {package_id};
 
 import android.os.Bundle;
+import android.content.Intent;
+import android.net.Uri;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 
@@ -1475,11 +1530,50 @@ public class MainActivity extends BridgeActivity {{
         WebSettings settings = webView.getSettings();
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
+        String appUserAgent = settings.getUserAgentString()
+            .replace("; wv", "")
+            .replace("Version/4.0 ", "");
+        settings.setUserAgentString(appUserAgent + " InhouseNotesApp/1.0");
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        settings.setJavaScriptEnabled(true);
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
         cookieManager.setAcceptThirdPartyCookies(webView, true);
         cookieManager.flush();
+
+        webView.addJavascriptInterface(new InhouseNativeBridge(), "InhouseNative");
+        handleAppCallback(getIntent());
+    }}
+
+    @Override
+    public void onNewIntent(Intent intent) {{
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAppCallback(intent);
+    }}
+
+    private void handleAppCallback(Intent intent) {{
+        if (intent == null || intent.getData() == null) return;
+        Uri data = intent.getData();
+        if (!"inhousenotes".equals(data.getScheme()) || !"oauth2callback".equals(data.getHost())) return;
+        String target = "https://inhousenotes.com/?inhouse_app=1";
+        String fragment = data.getEncodedFragment();
+        if (fragment != null && !fragment.isEmpty()) {{
+            target += "#" + fragment;
+        }}
+        final String finalTarget = target;
+        WebView webView = getBridge().getWebView();
+        webView.post(() -> webView.loadUrl(finalTarget));
+    }}
+
+    public class InhouseNativeBridge {{
+        @JavascriptInterface
+        public void openAuthUrl(String url) {{
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(intent);
+        }}
     }}
 
     @Override
@@ -1505,7 +1599,11 @@ public class MainActivity extends BridgeActivity {{
                 f"""package {package_id}
 
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebSettings
 import com.getcapacitor.BridgeActivity
 
 class MainActivity : BridgeActivity() {{
@@ -1515,11 +1613,49 @@ class MainActivity : BridgeActivity() {{
         val webView = bridge.webView
         webView.settings.domStorageEnabled = true
         webView.settings.databaseEnabled = true
+        val appUserAgent = webView.settings.userAgentString
+            .replace("; wv", "")
+            .replace("Version/4.0 ", "")
+        webView.settings.userAgentString = "$appUserAgent InhouseNotesApp/1.0"
+        webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        webView.settings.javaScriptEnabled = true
 
         CookieManager.getInstance().apply {{
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(webView, true)
             flush()
+        }}
+
+        webView.addJavascriptInterface(InhouseNativeBridge(), "InhouseNative")
+        handleAppCallback(intent)
+    }}
+
+    override fun onNewIntent(intent: Intent) {{
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAppCallback(intent)
+    }}
+
+    private fun handleAppCallback(intent: Intent?) {{
+        val data: Uri = intent?.data ?: return
+        if (data.scheme != "inhousenotes" || data.host != "oauth2callback") return
+        var target = "https://inhousenotes.com/?inhouse_app=1"
+        val fragment = data.encodedFragment
+        if (!fragment.isNullOrEmpty()) {{
+            target += "#$fragment"
+        }}
+        val finalTarget = target
+        bridge.webView.post {{
+            bridge.webView.loadUrl(finalTarget)
+        }}
+    }}
+
+    inner class InhouseNativeBridge {{
+        @JavascriptInterface
+        fun openAuthUrl(url: String) {{
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addCategory(Intent.CATEGORY_BROWSABLE)
+            startActivity(intent)
         }}
     }}
 
